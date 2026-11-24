@@ -115,9 +115,10 @@ type QueryInput struct {
 
 // Settlement configures the wrap-up phase that runs when a budget is hit.
 type Settlement struct {
-	Prompt        string   // wrap-up instruction injected as a user turn (empty = settlement off)
-	MaxTurns      int      // turn budget for the wrap-up phase itself (0 = default 2)
-	DisabledTools []string // tool names hidden from the model during wrap-up (e.g. ["Bash"])
+	Prompt        string        // wrap-up instruction injected as a user turn (empty = settlement off)
+	MaxTurns      int           // turn budget for the wrap-up phase itself (0 = default 2)
+	MaxDuration   time.Duration // wall-clock budget for the wrap-up phase (0 = default settlementGrace)
+	DisabledTools []string      // tool names hidden from the model during wrap-up (e.g. ["Bash"])
 	// PromptByReason optionally overrides Prompt based on WHY the run settled
 	// (keyed by the terminal reason, e.g. ReasonTimeout / ReasonMaxTurns). When the
 	// settling reason has a non-empty entry here it is used; otherwise Prompt is used.
@@ -232,12 +233,15 @@ type budgetTracker struct {
 
 type loop struct {
 	ctx context.Context
-	// toolCtx bounds tool execution with the run's MaxDuration deadline, so a tool
-	// that overruns the wall-clock budget is interrupted mid-flight (the model call
-	// stays on ctx — streams are never cut mid-flight). Derived from ctx, so a parent
-	// cancellation (pause/kill/shutdown) still cancels it. Swapped to ctx once the
-	// wrap-up phase begins, so settlement tools run live, bounded only by settleMaxTurns.
-	toolCtx context.Context
+	// toolCtx bounds BOTH tool execution and the model call with the run's MaxDuration
+	// deadline, so a tool OR a model turn that overruns the wall-clock budget is
+	// interrupted mid-flight (a slow/stuck model turn is the common ledger case).
+	// Derived from ctx, so a parent cancellation (pause/kill/shutdown) still cancels it.
+	// On entering the wrap-up phase it is re-based to a fresh settlementGrace deadline
+	// (see enterSettlementDeadline) so settlement has its own bounded wall-clock budget,
+	// not an unbounded 10-turn tail.
+	toolCtx  context.Context
+	stopTool context.CancelFunc // cancels the current toolCtx deadline; swapped on settlement
 	in      QueryInput
 	deps    QueryDeps
 	yield   func(Event, error) bool
@@ -273,6 +277,11 @@ const (
 	// maxLoopIterations is a defensive backstop; turnCount counts only tool-turns,
 	// so this only guards against a pathological recovery/continuation loop.
 	maxLoopIterations = 10000
+	// settlementGrace is the wall-clock budget the wrap-up phase gets once a run hits
+	// its MaxDuration. It bounds the up-to-settleMaxTurns wrap-up turns (each a model
+	// call) so settlement cannot run unbounded after the budget is spent; the run's
+	// total wall-clock is capped at ~MaxDuration + settlementGrace.
+	settlementGrace = 5 * time.Minute
 )
 
 func (l *loop) emit(ev Event) bool { return l.yield(ev, nil) }
@@ -394,10 +403,13 @@ func (l *loop) run() {
 	// wrap-up phase on the live parent ctx instead of aborting — see the tools branch.
 	l.toolCtx = l.ctx
 	if l.in.MaxDuration > 0 {
-		var stopTool context.CancelFunc
-		l.toolCtx, stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
-		defer stopTool()
+		l.toolCtx, l.stopTool = context.WithDeadline(l.ctx, l.startTime.Add(l.in.MaxDuration))
 	}
+	defer func() {
+		if l.stopTool != nil {
+			l.stopTool()
+		}
+	}()
 	iterations := 0
 	for {
 		if l.ctx.Err() != nil {
@@ -427,6 +439,23 @@ func (l *loop) run() {
 		if streamErr != nil {
 			if l.ctx.Err() != nil {
 				l.finish(ReasonAbortedStreaming, l.ctx.Err(), "")
+				return
+			}
+			// The run's own MaxDuration (toolCtx) deadline cut the model turn mid-stream
+			// while the parent is alive — the wall-clock budget is spent, not a provider
+			// failure. Already settling (the wrap-up grace ran out) → finish with the
+			// settle reason; otherwise enter wrap-up on a fresh settlementGrace budget.
+			if l.toolCtx.Err() != nil {
+				if l.settling {
+					l.finish(l.settleReason, nil, "")
+					return
+				}
+				if l.beginSettlement(ReasonTimeout, &schemas) {
+					l.enterSettlementDeadline()
+					l.lastContinue = ContinueNextTurn
+					continue
+				}
+				l.finish(ReasonTimeout, nil, "")
 				return
 			}
 			// Reactive recovery from prompt-too-long: one forced AutoCompact, then retry.
@@ -547,7 +576,7 @@ func (l *loop) run() {
 				return
 			}
 			if l.beginSettlement(ReasonTimeout, &schemas) {
-				l.toolCtx = l.ctx // wrap-up tools run live, bounded only by settleMaxTurns
+				l.enterSettlementDeadline() // wrap-up runs on its own settlementGrace budget
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -580,6 +609,7 @@ func (l *loop) run() {
 				reason = ReasonTimeout
 			}
 			if l.beginSettlement(reason, &schemas) {
+				l.enterSettlementDeadline() // wrap-up runs on its own settlementGrace budget
 				l.lastContinue = ContinueNextTurn
 				continue
 			}
@@ -589,6 +619,28 @@ func (l *loop) run() {
 		l.turnCount = nextTurn
 		l.lastContinue = ContinueNextTurn
 	}
+}
+
+// enterSettlementDeadline re-bases toolCtx to a fresh settlementGrace wall-clock
+// budget as the wrap-up phase begins, replacing the main-phase deadline (already
+// spent). Both wrap-up tools and wrap-up model calls run on this ctx, so a slow
+// wrap-up turn is cut and the run finishes with its settle reason instead of
+// running up to settleMaxTurns unbounded. When the run has no MaxDuration budget at
+// all, settlement stays live on ctx (unchanged behavior).
+func (l *loop) enterSettlementDeadline() {
+	if l.stopTool != nil {
+		l.stopTool()
+		l.stopTool = nil
+	}
+	if l.in.MaxDuration <= 0 {
+		l.toolCtx = l.ctx
+		return
+	}
+	grace := settlementGrace
+	if l.in.Settlement != nil && l.in.Settlement.MaxDuration > 0 {
+		grace = l.in.Settlement.MaxDuration
+	}
+	l.toolCtx, l.stopTool = context.WithTimeout(l.ctx, grace)
 }
 
 // settleMaxTurns is the wrap-up phase's own turn budget (default 2).
@@ -829,7 +881,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 		return exec.drain()
 	}
 
-	for ev, e := range l.deps.CallModel(l.ctx, req) {
+	for ev, e := range l.deps.CallModel(l.toolCtx, req) {
 		if e != nil {
 			err = e
 			break
@@ -892,7 +944,7 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 // emission, and recorder all see identical numbers.
 func (l *loop) completeAndExecute(req llm.CompletionRequest) (asst llm.Message, exec *streamExec, stopReason string, err error, consumerStopped, aborted bool) {
 	exec = newStreamExec(l)
-	msg, sr, usage, cerr := l.deps.CallModelSync(l.ctx, req)
+	msg, sr, usage, cerr := l.deps.CallModelSync(l.toolCtx, req)
 	if cerr != nil {
 		return asst, exec, "", cerr, false, false
 	}
